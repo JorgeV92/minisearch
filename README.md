@@ -1,0 +1,3 @@
+# MiniSearch
+
+Search with rust 
