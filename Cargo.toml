@@ -1,6 +1,23 @@
 [package]
 name = "minisearch"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A small Rust search engine with an inverted index, BM25 scoring, phrase matching, and index persistence."
+license = "MIT"
+repository = "https://github.com/JorgeV92/minisearch"
+readme = "README.md"
+keywords = ["search", "index", "bm25", "rust", "inverted-index"]
+categories = ["command-line-utilities", "text-processing"]
 
-[dependencies]
+[lib]
+name = "minisearch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "minisearch"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
