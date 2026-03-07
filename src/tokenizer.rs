@@ -42,7 +42,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tokenization_normalizes_case_and_punctuantion() {
+    fn tokenization_normalizes_case_and_punctuation() {
         let tokens = tokenize("Rust, Search-Engine! 101");
         assert_eq!(tokens, vec!["rust", "search", "engine", "101"]);
     }
