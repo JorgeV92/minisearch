@@ -28,3 +28,30 @@ pub fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
+/// Tokenizes text and records positions for phrase matching.
+pub fn tokenize_with_positions(text: &str) -> Vec<PositionedToken> {
+    tokenize(text)
+        .into_iter()
+        .enumerate()
+        .map(|(position, term)| PositionedToken { term, position })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenization_normalizes_case_and_punctuantion() {
+        let tokens = tokenize("Rust, Search-Engine! 101");
+        assert_eq!(tokens, vec!["rust", "search", "engine", "101"]);
+    }
+
+    #[test]
+    fn positions_are_montonic() {
+        let tokens = tokenize_with_positions("alpha beta beta");
+        assert_eq!(tokens[0].term, "alpha");
+        assert_eq!(tokens[0].position, 0);
+        assert_eq!(tokens[2].position, 2);
+    }
+}
