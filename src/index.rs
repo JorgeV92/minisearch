@@ -110,5 +110,158 @@ impl SearchEngine {
         }
 
         self.documents.push(DocumentMeta::new(doc_id, path, length ));
+        self.recompute_average_length();
     }
+
+    pub fn build_from_directory(dir: impl AsRef<Path>) -> Result <usize, SearchError> {
+        let mut engine = Self::new();
+        engine.index_directory(dir)?;
+        Ok(engine)
+    }
+
+    pub fn index_directory(&mut self, dir: impl AsRef<Path>) -> Result<usize, SearchError> {
+        let dir = dir.as_ref();
+        if !dir.exists() {
+            return Err(SearchError::InvalidArgument(
+                format!("directory does not exits: {}",
+                dir.display()
+            )));
+        }
+
+        if !dir.is_dir() {
+            return Err(SearchError::InvalidArgument(
+                format!(
+                    "path is not a directory: {}",
+                    dir.display()
+                )
+            ));
+        }
+
+        let mut files = Vec::new();
+        collect_text_files(dir, &mut files)?;
+        files.sort();
+
+        let base = dir.to_path_buf();
+        let start_count = self.document_count();
+
+        for file in files {
+            let content = fs::read_to_string(&file)?;
+            let relative = file 
+                .strip_prefix(&base)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| file.clone());
+            self.add_document(relative.display().to_string, &content);
+        }
+    
+        Ok(self.document_count() - start_count)
+    }
+
+    pub fn search(&self, raw_query: &str, top_k: usize) -> Vec<SearchResult> {
+        let parsed = parse_query(raw_query);
+        self.search_parsed(&parsed, top_k)
+    }
+
+    pub fn search_parsed(&self, parsed: &ParsedQuery, top_k: usize) -> Vec<SearchResult> {
+        if self.documents.is_empty() || top_k == 0 {
+            return Vec::new();
+        }
+
+        let mut scores = HashMap::new();
+        let mut matched_terms: HashMap<usize, HashSet<String>> = HashMap::new();
+        let scoring_terms = parsed 
+            .optional_terms
+            .iter()
+            .chain(parsed.required_terms.iter());
+
+        for term in scoring_terms {
+            let Some(postings) = self.postings.get(term) else {
+                continue;
+            };
+            let document_frequency = postings.len();
+            for posting in postings {
+                let score = self.bm25_score(posting.doc_id, posting.term_frequency(), document_frequency);
+                *score.entry(posting.doc_id).or_insert(0.0) += score;
+                matched_terms
+                    .entry(posting.doc_id)
+                    .or_default()
+                    .insert(term.clone());
+            }
+        }
+
+        let has_scoring_terms = !parsed.optional_terms.is_empty() || !parsed.required_terms.is_empty();
+        let phrase_only_mode = !parsed.phrases.is_empty() && !has_scoring_terms;
+        if phrase_only_mode {
+            for doc in &self.documents {
+                scores.entry(doc.id).or_insert(0.0);
+            }
+        }
+
+        for phrase in &parsed.phrases {
+            for doc in &self.documents {
+                if self.doc_has_phrase(doc.id, phrase) {
+                    let boost = 2.0 * phrase.terms.len() as f64;
+                    *scores.entry(doc.id).or_insert(0.0) += boost;
+                    matched_terms
+                        .entry(doc.id)
+                        .or_default()
+                        .insert(phrase.terms.join(" "));
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        'doc_loop: for (doc_id, mut score) in scores {
+            if !self.satisfies_required_terms(doc_id, &parsed.required_terms) {
+                continue;
+            }
+            if self.matches_any_excluded_term(doc_id, &parsed.excluded_terms) {
+                continue;
+            }
+            if phrase_only_mode && !parsed.phrases.iter().any(|phrase| self.doc_has_phrase(doc_id, phrase)) {
+                continue;
+            }
+
+            let path = self.documents[doc_id].path.clone();
+            score -= path.len() as f64 * 1e-9;
+
+            let mut terms = matched_terms
+                .remove(&doc_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();;
+            terms.sort();
+
+            for required in &parsed.required_terms {
+                if !terms,.iter().any(|term| term == required) {
+                    if self.contains_term(doc_id, required) {
+                        terms.push(required.clone);
+                    } else {
+                        continue 'doc_loop;
+                    }
+                }
+            }
+
+            terms.sort();
+            terms.dedup();
+
+            results.push(SearchResult {
+                doc_id,
+                path,
+                score,
+                matched_terms: terms,
+            });
+        }
+
+        results.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        results.truncate(top_k);
+        results
+    }
+
 }
