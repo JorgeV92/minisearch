@@ -1,4 +1,4 @@
-// !Core search engine implementation.
+//! Core search engine implementation.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -14,6 +14,7 @@ use crate::tokenizer::tokenize_with_positions;
 const BM25_K1: f64 = 1.5;
 const BM25_B: f64 = 0.75;
 
+/// A positional posting for a term in one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Posting {
     pub doc_id: usize,
@@ -26,14 +27,16 @@ impl Posting {
     }
 }
 
+/// One search result returned by the engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     pub doc_id: usize,
-    pub path: String, 
+    pub path: String,
     pub score: f64,
     pub matched_terms: Vec<String>,
 }
 
+/// Error type used by indexing, searching, and persistence APIs.
 #[derive(Debug)]
 pub enum SearchError {
     Io(io::Error),
@@ -59,7 +62,7 @@ impl From<io::Error> for SearchError {
     }
 }
 
-
+/// A small in-memory search engine backed by an inverted index.
 #[derive(Debug, Clone, Default)]
 pub struct SearchEngine {
     pub(crate) documents: Vec<DocumentMeta>,
@@ -68,26 +71,32 @@ pub struct SearchEngine {
 }
 
 impl SearchEngine {
+    /// Creates an empty engine.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns document metadata for all indexed documents.
     pub fn documents(&self) -> &[DocumentMeta] {
         &self.documents
     }
 
+    /// Returns the number of indexed documents.
     pub fn document_count(&self) -> usize {
         self.documents.len()
     }
 
+    /// Returns the number of unique terms in the lexicon.
     pub fn vocabulary_size(&self) -> usize {
         self.postings.len()
     }
 
-    pub fn average_document_lenght(&self) -> f64 {
+    /// Returns the average document length in normalized tokens.
+    pub fn average_document_length(&self) -> f64 {
         self.avg_doc_length
     }
 
+    /// Adds one document to the engine.
     pub fn add_document(&mut self, path: impl Into<String>, content: &str) {
         let path = path.into();
         let doc_id = self.documents.len();
@@ -106,35 +115,34 @@ impl SearchEngine {
             self.postings
                 .entry(term)
                 .or_default()
-                .push(Posting {doc_id, positions});
+                .push(Posting { doc_id, positions });
         }
 
-        self.documents.push(DocumentMeta::new(doc_id, path, length ));
+        self.documents.push(DocumentMeta::new(doc_id, path, length));
         self.recompute_average_length();
     }
 
-    pub fn build_from_directory(dir: impl AsRef<Path>) -> Result <usize, SearchError> {
+    /// Builds an engine from a directory of `.txt` and `.md` files.
+    pub fn build_from_directory(dir: impl AsRef<Path>) -> Result<Self, SearchError> {
         let mut engine = Self::new();
         engine.index_directory(dir)?;
         Ok(engine)
     }
 
+    /// Indexes all `.txt` and `.md` files under a directory recursively.
     pub fn index_directory(&mut self, dir: impl AsRef<Path>) -> Result<usize, SearchError> {
         let dir = dir.as_ref();
         if !dir.exists() {
-            return Err(SearchError::InvalidArgument(
-                format!("directory does not exits: {}",
+            return Err(SearchError::InvalidArgument(format!(
+                "directory does not exist: {}",
                 dir.display()
             )));
         }
-
         if !dir.is_dir() {
-            return Err(SearchError::InvalidArgument(
-                format!(
-                    "path is not a directory: {}",
-                    dir.display()
-                )
-            ));
+            return Err(SearchError::InvalidArgument(format!(
+                "path is not a directory: {}",
+                dir.display()
+            )));
         }
 
         let mut files = Vec::new();
@@ -146,29 +154,31 @@ impl SearchEngine {
 
         for file in files {
             let content = fs::read_to_string(&file)?;
-            let relative = file 
+            let relative = file
                 .strip_prefix(&base)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|_| file.clone());
-            self.add_document(relative.display().to_string, &content);
+            self.add_document(relative.display().to_string(), &content);
         }
-    
+
         Ok(self.document_count() - start_count)
     }
 
+    /// Searches the index using a raw query string.
     pub fn search(&self, raw_query: &str, top_k: usize) -> Vec<SearchResult> {
         let parsed = parse_query(raw_query);
         self.search_parsed(&parsed, top_k)
     }
 
+    /// Searches the index using a pre-parsed query.
     pub fn search_parsed(&self, parsed: &ParsedQuery, top_k: usize) -> Vec<SearchResult> {
         if self.documents.is_empty() || top_k == 0 {
             return Vec::new();
         }
 
-        let mut scores = HashMap::new();
+        let mut scores: HashMap<usize, f64> = HashMap::new();
         let mut matched_terms: HashMap<usize, HashSet<String>> = HashMap::new();
-        let scoring_terms = parsed 
+        let scoring_terms = parsed
             .optional_terms
             .iter()
             .chain(parsed.required_terms.iter());
@@ -180,7 +190,7 @@ impl SearchEngine {
             let document_frequency = postings.len();
             for posting in postings {
                 let score = self.bm25_score(posting.doc_id, posting.term_frequency(), document_frequency);
-                *score.entry(posting.doc_id).or_insert(0.0) += score;
+                *scores.entry(posting.doc_id).or_insert(0.0) += score;
                 matched_terms
                     .entry(posting.doc_id)
                     .or_default()
@@ -217,10 +227,12 @@ impl SearchEngine {
             if self.matches_any_excluded_term(doc_id, &parsed.excluded_terms) {
                 continue;
             }
+
             if phrase_only_mode && !parsed.phrases.iter().any(|phrase| self.doc_has_phrase(doc_id, phrase)) {
                 continue;
             }
 
+            // Tiny tie-breaker favoring shorter paths for equal scores.
             let path = self.documents[doc_id].path.clone();
             score -= path.len() as f64 * 1e-9;
 
@@ -228,19 +240,19 @@ impl SearchEngine {
                 .remove(&doc_id)
                 .unwrap_or_default()
                 .into_iter()
-                .collect::<Vec<_>>();;
+                .collect::<Vec<_>>();
             terms.sort();
 
             for required in &parsed.required_terms {
-                if !terms,.iter().any(|term| term == required) {
+                if !terms.iter().any(|term| term == required) {
+                    // Required term matched but may not have been inserted in phrase-only situations.
                     if self.contains_term(doc_id, required) {
-                        terms.push(required.clone);
+                        terms.push(required.clone());
                     } else {
                         continue 'doc_loop;
                     }
                 }
             }
-
             terms.sort();
             terms.dedup();
 
@@ -259,9 +271,11 @@ impl SearchEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.path.cmp(&right.path))
         });
-
         results.truncate(top_k);
         results
     }
 
+    pub fn save_to_path(path: impl AsRef<Path>) -> Result<Self, SearchError> {
+        storage::load_engine(self, path.as_ref())
+    }
 }

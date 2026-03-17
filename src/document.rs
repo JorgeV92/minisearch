@@ -1,3 +1,5 @@
+//! Document metadata used by the search engine.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentMeta {
     pub id: usize,
