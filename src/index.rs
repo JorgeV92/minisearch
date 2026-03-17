@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::document::DocumentMeta;
+use crate::document::{self, DocumentMeta};
 use crate::query::{parse_query, ParsedQuery, PhraseQuery};
 use crate::storage;
 use crate::tokenizer::tokenize_with_positions;
@@ -275,7 +275,27 @@ impl SearchEngine {
         results
     }
 
-    pub fn save_to_path(path: impl AsRef<Path>) -> Result<Self, SearchError> {
-        storage::load_engine(self, path.as_ref())
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SearchError> {
+        storage::save_engine(self, path.as_ref())
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SearchError> {
+        storage::load_engine(path.as_ref())
+    }
+
+    pub(crate) fn postings(&self) -> &HashMap<String, Vec<Posting>> {
+        &self.postings
+    }
+
+    pub(crate) fn from_parts(
+        documents: Vec<DocumentMeta>,
+        postings: HashMap<String, Vec<Posting>>,
+        avg_doc_length: f64,
+    ) -> Self {
+        Self {
+            documents,
+            postings,
+            avg_doc_length,
+        }
     }
 }

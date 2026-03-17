@@ -15,7 +15,7 @@ This project builds an **inverted index** over local text files, supports **BM25
   - excluded terms: `-java`
   - quoted phrases: `"distributed systems"`
 
-  ## Example library usage
+## Example library usage
 
 ```rust
 use mini_search_engine::SearchEngine;
