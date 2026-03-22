@@ -12,8 +12,10 @@
 
 pub mod document;
 pub mod index;
-pub mod tokenizer;
 pub mod query;
 pub mod storage;
+pub mod tokenizer;
 
 pub use document::DocumentMeta;
+pub use index::{SearchEngine, SearchError, SearchResult};
+pub use query::{ParsedQuery, PhraseQuery};
