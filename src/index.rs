@@ -298,4 +298,147 @@ impl SearchEngine {
             avg_doc_length,
         }
     }
+
+    fn recompute_average_length(&mut self) {
+        if self.documents.is_empty() {
+            self.avg_doc_length = 0.0;
+            return;
+        }
+        let total_length: usize = self.documents.iter().map(|doc| doc.length).sum();
+        self.avg_doc_length = total_length as f64 / self.documents.len() as f64;
+    }
+
+    fn bm25_score(&self, doc_id: usize, term_frequency: usize, document_frequency: usize) -> f64 {
+        let total_docs = self.documents.len() as f64;
+        if total_docs == 0.0 || term_frequency == 0 {
+            return 0.0;
+        }
+
+        let doc_length = self.documents[doc_id].length as f64;
+        let avg_length = if self.avg_doc_length > 0.0 {
+            self.avg_doc_length
+        } else {
+            1.0
+        };
+        let tf = term_frequency as f64;
+        let df = document_frequency as f64;
+
+        let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+        let numerator = tf * (BM25_K1 + 1.0);
+        let denominator = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * (doc_length / avg_length));
+        idf * (numerator / denominator)
+    }
+
+    fn satisfies_required_terms(&self, doc_id: usize, required_terms: &[String]) -> bool {
+        required_terms.iter().all(|term| self.contains_term(doc_id, term))
+    }
+
+    fn matches_any_excluded_term(&self, doc_id: usize, excluded_terms: &[String]) -> bool {
+        excluded_terms.iter().any(|term| self.contains_term(doc_id, term))
+    }
+
+    fn contains_term(&self, doc_id: usize, term: &str) -> bool {
+        self.postings
+            .get(term)
+            .map(|postings| postings.iter().any(|posting| posting.doc_id == doc_id))
+            .unwrap_or(false)
+    }
+
+    fn positions_for_term_in_doc(&self, term: &str, doc_id: usize) -> Option<&[usize]> {
+        self.postings.get(term).and_then(|postings| {
+            postings
+                .iter()
+                .find(|posting| posting.doc_id == doc_id)
+                .map(|posting| posting.positions.as_slice())
+        })
+    }
+
+    fn doc_has_phrase(&self, doc_id: usize, phrase: &PhraseQuery) -> bool {
+        if phrase.terms.is_empty() {
+            return false;
+        }
+        if phrase.terms.len() == 1 {
+            return self.contains_term(doc_id, &phrase.terms[0]);
+        }
+
+        let Some(first_positions) = self.positions_for_term_in_doc(&phrase.terms[0], doc_id) else {
+            return false;
+        };
+
+        let mut lookup_sets: Vec<HashSet<usize>> = Vec::with_capacity(phrase.terms.len() - 1);
+        for term in phrase.terms.iter().skip(1) {
+            let Some(positions) = self.positions_for_term_in_doc(term, doc_id) else {
+                return false;
+            };
+            lookup_sets.push(positions.iter().copied().collect());
+        }
+
+        'outer: for start in first_positions {
+            for (offset, set) in lookup_sets.iter().enumerate() {
+                if !set.contains(&(start + offset + 1)) {
+                    continue 'outer;
+                }
+            }
+            return true;
+        }
+
+        false
+    }
+}
+
+fn collect_text_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), SearchError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_text_files(&path, files)?;
+        } else if is_supported_text_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_text_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("txt") | Some("md")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bm25_prefers_document_with_more_matches() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("doc1.txt", "rust search engine rust bm25");
+        engine.add_document("doc2.txt", "rust engine");
+
+        let results = engine.search("rust", 10);
+        assert_eq!(results[0].path, "doc1.txt");
+    }
+
+    #[test]
+    fn phrase_query_matches_exact_sequence() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("a.txt", "distributed systems are fun");
+        engine.add_document("b.txt", "systems distributed are mentioned");
+
+        let results = engine.search("\"distributed systems\"", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "a.txt");
+    }
+
+    #[test]
+    fn required_and_excluded_terms_filter_results() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("rust.txt", "rust ownership borrowing memory safety");
+        engine.add_document("mixed.txt", "rust and java interoperability");
+
+        let results = engine.search("+rust -java", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "rust.txt");
+    }
 }

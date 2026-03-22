@@ -1,4 +1,4 @@
-# MiniSearch
+# minisearch
 
 ### Search with rust 
 
