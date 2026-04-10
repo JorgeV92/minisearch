@@ -200,11 +200,9 @@ Indexes are stored in a plain-text format that begins with the `MSE1` header and
 - document metadata
 - positional postings for each term
 
-The format is intentionally simple and human-readable, which makes it convenient for debugging and small tools.
-
-## Development
+<!-- ## Development
 
 ```bash
 cargo test
 cargo test --examples
-```
+``` -->
