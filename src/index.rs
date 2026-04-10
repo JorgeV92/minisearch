@@ -6,10 +6,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::document::{self, DocumentMeta};
+use crate::document::DocumentMeta;
 use crate::query::{parse_query, ParsedQuery, PhraseQuery};
 use crate::storage;
-use crate::tokenizer::tokenize_with_positions;
+use crate::tokenizer::{tokenize, tokenize_with_positions};
 
 const BM25_K1: f64 = 1.5;
 const BM25_B: f64 = 0.75;
@@ -34,6 +34,110 @@ pub struct SearchResult {
     pub path: String,
     pub score: f64,
     pub matched_terms: Vec<String>,
+}
+
+/// Aggregate statistics for one term in the vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermStat {
+    pub term: String,
+    pub document_frequency: usize,
+    pub total_frequency: usize,
+}
+
+/// Directory indexing options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexOptions {
+    extensions: Vec<String>,
+    max_file_size_bytes: Option<u64>,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            extensions: vec!["txt".to_string(), "md".to_string()],
+            max_file_size_bytes: None,
+        }
+    }
+}
+
+impl IndexOptions {
+    /// Creates the default indexing options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the supported file extensions.
+    pub fn with_extensions<I, S>(mut self, extensions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut normalized = Vec::new();
+        for extension in extensions {
+            let extension = extension.as_ref().trim().trim_start_matches('.');
+            if extension.is_empty() {
+                continue;
+            }
+
+            let extension = extension.to_ascii_lowercase();
+            if !normalized.iter().any(|existing| existing == &extension) {
+                normalized.push(extension);
+            }
+        }
+        self.extensions = normalized;
+        self
+    }
+
+    /// Skips files larger than the provided byte size.
+    pub fn with_max_file_size_bytes(mut self, max_file_size_bytes: u64) -> Self {
+        self.max_file_size_bytes = Some(max_file_size_bytes);
+        self
+    }
+
+    /// Returns the normalized extensions used while indexing.
+    pub fn extensions(&self) -> &[String] {
+        &self.extensions
+    }
+
+    /// Returns the configured maximum file size, if any.
+    pub fn max_file_size_bytes(&self) -> Option<u64> {
+        self.max_file_size_bytes
+    }
+
+    fn extension_set(&self) -> HashSet<String> {
+        self.extensions.iter().cloned().collect()
+    }
+}
+
+/// Search-time filtering options.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SearchOptions {
+    pub top_k: usize,
+    pub path_prefix: Option<String>,
+    pub min_score: Option<f64>,
+}
+
+impl SearchOptions {
+    /// Creates a new search configuration with the requested result limit.
+    pub fn new(top_k: usize) -> Self {
+        Self {
+            top_k,
+            path_prefix: None,
+            min_score: None,
+        }
+    }
+
+    /// Restricts results to documents whose stored path starts with the prefix.
+    pub fn with_path_prefix(mut self, path_prefix: impl Into<String>) -> Self {
+        self.path_prefix = Some(path_prefix.into());
+        self
+    }
+
+    /// Drops matches whose score falls below the threshold.
+    pub fn with_min_score(mut self, min_score: f64) -> Self {
+        self.min_score = Some(min_score);
+        self
+    }
 }
 
 /// Error type used by indexing, searching, and persistence APIs.
@@ -81,6 +185,11 @@ impl SearchEngine {
         &self.documents
     }
 
+    /// Returns one document by its internal ID.
+    pub fn document(&self, doc_id: usize) -> Option<&DocumentMeta> {
+        self.documents.get(doc_id)
+    }
+
     /// Returns the number of indexed documents.
     pub fn document_count(&self) -> usize {
         self.documents.len()
@@ -91,9 +200,72 @@ impl SearchEngine {
         self.postings.len()
     }
 
+    /// Returns the sorted vocabulary.
+    pub fn vocabulary(&self) -> Vec<String> {
+        let mut terms: Vec<_> = self.postings.keys().cloned().collect();
+        terms.sort();
+        terms
+    }
+
     /// Returns the average document length in normalized tokens.
     pub fn average_document_length(&self) -> f64 {
         self.avg_doc_length
+    }
+
+    /// Returns how many documents contain the term.
+    pub fn document_frequency(&self, term: &str) -> usize {
+        let Some(term) = normalize_single_term(term) else {
+            return 0;
+        };
+        self.postings
+            .get(&term)
+            .map(|postings| postings.len())
+            .unwrap_or(0)
+    }
+
+    /// Returns the frequency of a term in one document.
+    pub fn term_frequency(&self, doc_id: usize, term: &str) -> usize {
+        let Some(term) = normalize_single_term(term) else {
+            return 0;
+        };
+        self.positions_for_term_in_doc(&term, doc_id)
+            .map(|positions| positions.len())
+            .unwrap_or(0)
+    }
+
+    /// Reports whether the document contains the term.
+    pub fn contains_term(&self, doc_id: usize, term: &str) -> bool {
+        let Some(term) = normalize_single_term(term) else {
+            return false;
+        };
+        self.contains_normalized_term(doc_id, &term)
+    }
+
+    /// Returns the most frequent terms in the vocabulary.
+    pub fn top_terms(&self, limit: usize) -> Vec<TermStat> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut stats = self
+            .postings
+            .iter()
+            .map(|(term, postings)| TermStat {
+                term: term.clone(),
+                document_frequency: postings.len(),
+                total_frequency: postings.iter().map(Posting::term_frequency).sum(),
+            })
+            .collect::<Vec<_>>();
+
+        stats.sort_by(|left, right| {
+            right
+                .total_frequency
+                .cmp(&left.total_frequency)
+                .then_with(|| right.document_frequency.cmp(&left.document_frequency))
+                .then_with(|| left.term.cmp(&right.term))
+        });
+        stats.truncate(limit);
+        stats
     }
 
     /// Adds one document to the engine.
@@ -129,8 +301,27 @@ impl SearchEngine {
         Ok(engine)
     }
 
+    /// Builds an engine from a directory using custom indexing options.
+    pub fn build_from_directory_with_options(
+        dir: impl AsRef<Path>,
+        options: &IndexOptions,
+    ) -> Result<Self, SearchError> {
+        let mut engine = Self::new();
+        engine.index_directory_with_options(dir, options)?;
+        Ok(engine)
+    }
+
     /// Indexes all `.txt` and `.md` files under a directory recursively.
     pub fn index_directory(&mut self, dir: impl AsRef<Path>) -> Result<usize, SearchError> {
+        self.index_directory_with_options(dir, &IndexOptions::default())
+    }
+
+    /// Indexes files under a directory recursively using custom options.
+    pub fn index_directory_with_options(
+        &mut self,
+        dir: impl AsRef<Path>,
+        options: &IndexOptions,
+    ) -> Result<usize, SearchError> {
         let dir = dir.as_ref();
         if !dir.exists() {
             return Err(SearchError::InvalidArgument(format!(
@@ -146,13 +337,21 @@ impl SearchEngine {
         }
 
         let mut files = Vec::new();
-        collect_text_files(dir, &mut files)?;
+        let extension_set = options.extension_set();
+        collect_supported_files(dir, &extension_set, &mut files)?;
         files.sort();
 
         let base = dir.to_path_buf();
         let start_count = self.document_count();
 
         for file in files {
+            if let Some(max_file_size_bytes) = options.max_file_size_bytes() {
+                let file_size = fs::metadata(&file)?.len();
+                if file_size > max_file_size_bytes {
+                    continue;
+                }
+            }
+
             let content = fs::read_to_string(&file)?;
             let relative = file
                 .strip_prefix(&base)
@@ -166,30 +365,50 @@ impl SearchEngine {
 
     /// Searches the index using a raw query string.
     pub fn search(&self, raw_query: &str, top_k: usize) -> Vec<SearchResult> {
+        self.search_with_options(raw_query, &SearchOptions::new(top_k))
+    }
+
+    /// Searches the index using a raw query string and extra search-time filters.
+    pub fn search_with_options(
+        &self,
+        raw_query: &str,
+        options: &SearchOptions,
+    ) -> Vec<SearchResult> {
         let parsed = parse_query(raw_query);
-        self.search_parsed(&parsed, top_k)
+        self.search_parsed_with_options(&parsed, options)
     }
 
     /// Searches the index using a pre-parsed query.
     pub fn search_parsed(&self, parsed: &ParsedQuery, top_k: usize) -> Vec<SearchResult> {
+        self.search_parsed_with_options(parsed, &SearchOptions::new(top_k))
+    }
+
+    /// Searches the index using a pre-parsed query and extra search-time filters.
+    pub fn search_parsed_with_options(
+        &self,
+        parsed: &ParsedQuery,
+        options: &SearchOptions,
+    ) -> Vec<SearchResult> {
+        let top_k = options.top_k;
         if self.documents.is_empty() || top_k == 0 {
             return Vec::new();
         }
 
         let mut scores: HashMap<usize, f64> = HashMap::new();
         let mut matched_terms: HashMap<usize, HashSet<String>> = HashMap::new();
+
         let scoring_terms = parsed
             .optional_terms
             .iter()
             .chain(parsed.required_terms.iter());
-
         for term in scoring_terms {
             let Some(postings) = self.postings.get(term) else {
                 continue;
             };
             let document_frequency = postings.len();
             for posting in postings {
-                let score = self.bm25_score(posting.doc_id, posting.term_frequency(), document_frequency);
+                let score =
+                    self.bm25_score(posting.doc_id, posting.term_frequency(), document_frequency);
                 *scores.entry(posting.doc_id).or_insert(0.0) += score;
                 matched_terms
                     .entry(posting.doc_id)
@@ -198,15 +417,17 @@ impl SearchEngine {
             }
         }
 
-        let has_scoring_terms = !parsed.optional_terms.is_empty() || !parsed.required_terms.is_empty();
-        let phrase_only_mode = !parsed.phrases.is_empty() && !has_scoring_terms;
+        let has_scoring_terms =
+            !parsed.optional_terms.is_empty() || !parsed.required_terms.is_empty();
+        let has_scoring_phrases = !parsed.phrases.is_empty() || !parsed.required_phrases.is_empty();
+        let phrase_only_mode = has_scoring_phrases && !has_scoring_terms;
         if phrase_only_mode {
             for doc in &self.documents {
                 scores.entry(doc.id).or_insert(0.0);
             }
         }
 
-        for phrase in &parsed.phrases {
+        for phrase in parsed.phrases.iter().chain(parsed.required_phrases.iter()) {
             for doc in &self.documents {
                 if self.doc_has_phrase(doc.id, phrase) {
                     let boost = 2.0 * phrase.terms.len() as f64;
@@ -220,21 +441,40 @@ impl SearchEngine {
         }
 
         let mut results = Vec::new();
-        'doc_loop: for (doc_id, mut score) in scores {
+        'doc_loop: for (doc_id, score) in scores {
             if !self.satisfies_required_terms(doc_id, &parsed.required_terms) {
                 continue;
             }
             if self.matches_any_excluded_term(doc_id, &parsed.excluded_terms) {
                 continue;
             }
-
-            if phrase_only_mode && !parsed.phrases.iter().any(|phrase| self.doc_has_phrase(doc_id, phrase)) {
+            if !self.satisfies_required_phrases(doc_id, &parsed.required_phrases) {
+                continue;
+            }
+            if self.matches_any_excluded_phrases(doc_id, &parsed.excluded_phrases) {
+                continue;
+            }
+            if phrase_only_mode
+                && !parsed
+                    .phrases
+                    .iter()
+                    .chain(parsed.required_phrases.iter())
+                    .any(|phrase| self.doc_has_phrase(doc_id, phrase))
+            {
                 continue;
             }
 
-            // Tiny tie-breaker favoring shorter paths for equal scores.
             let path = self.documents[doc_id].path.clone();
-            score -= path.len() as f64 * 1e-9;
+            if let Some(path_prefix) = options.path_prefix.as_deref() {
+                if !path.starts_with(path_prefix) {
+                    continue;
+                }
+            }
+            if let Some(min_score) = options.min_score {
+                if score < min_score {
+                    continue;
+                }
+            }
 
             let mut terms = matched_terms
                 .remove(&doc_id)
@@ -245,14 +485,24 @@ impl SearchEngine {
 
             for required in &parsed.required_terms {
                 if !terms.iter().any(|term| term == required) {
-                    // Required term matched but may not have been inserted in phrase-only situations.
-                    if self.contains_term(doc_id, required) {
+                    if self.contains_normalized_term(doc_id, required) {
                         terms.push(required.clone());
                     } else {
                         continue 'doc_loop;
                     }
                 }
             }
+            for phrase in &parsed.required_phrases {
+                let phrase_text = phrase.terms.join(" ");
+                if !terms.iter().any(|term| term == &phrase_text) {
+                    if self.doc_has_phrase(doc_id, phrase) {
+                        terms.push(phrase_text);
+                    } else {
+                        continue 'doc_loop;
+                    }
+                }
+            }
+
             terms.sort();
             terms.dedup();
 
@@ -330,14 +580,34 @@ impl SearchEngine {
     }
 
     fn satisfies_required_terms(&self, doc_id: usize, required_terms: &[String]) -> bool {
-        required_terms.iter().all(|term| self.contains_term(doc_id, term))
+        required_terms
+            .iter()
+            .all(|term| self.contains_normalized_term(doc_id, term))
     }
 
     fn matches_any_excluded_term(&self, doc_id: usize, excluded_terms: &[String]) -> bool {
-        excluded_terms.iter().any(|term| self.contains_term(doc_id, term))
+        excluded_terms
+            .iter()
+            .any(|term| self.contains_normalized_term(doc_id, term))
     }
 
-    fn contains_term(&self, doc_id: usize, term: &str) -> bool {
+    fn satisfies_required_phrases(&self, doc_id: usize, required_phrases: &[PhraseQuery]) -> bool {
+        required_phrases
+            .iter()
+            .all(|phrase| self.doc_has_phrase(doc_id, phrase))
+    }
+
+    fn matches_any_excluded_phrases(
+        &self,
+        doc_id: usize,
+        excluded_phrases: &[PhraseQuery],
+    ) -> bool {
+        excluded_phrases
+            .iter()
+            .any(|phrase| self.doc_has_phrase(doc_id, phrase))
+    }
+
+    fn contains_normalized_term(&self, doc_id: usize, term: &str) -> bool {
         self.postings
             .get(term)
             .map(|postings| postings.iter().any(|posting| posting.doc_id == doc_id))
@@ -358,7 +628,7 @@ impl SearchEngine {
             return false;
         }
         if phrase.terms.len() == 1 {
-            return self.contains_term(doc_id, &phrase.terms[0]);
+            return self.contains_normalized_term(doc_id, &phrase.terms[0]);
         }
 
         let Some(first_positions) = self.positions_for_term_in_doc(&phrase.terms[0], doc_id) else {
@@ -386,29 +656,43 @@ impl SearchEngine {
     }
 }
 
-fn collect_text_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), SearchError> {
+fn normalize_single_term(term: &str) -> Option<String> {
+    let mut tokens = tokenize(term);
+    if tokens.len() == 1 {
+        tokens.pop()
+    } else {
+        None
+    }
+}
+
+fn collect_supported_files(
+    dir: &Path,
+    extensions: &HashSet<String>,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), SearchError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_text_files(&path, files)?;
-        } else if is_supported_text_file(&path) {
+            collect_supported_files(&path, extensions, files)?;
+        } else if is_supported_file(&path, extensions) {
             files.push(path);
         }
     }
     Ok(())
 }
 
-fn is_supported_text_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("txt") | Some("md")
-    )
+fn is_supported_file(path: &Path, extensions: &HashSet<String>) -> bool {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    extensions.contains(&extension.to_ascii_lowercase())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn bm25_prefers_document_with_more_matches() {
@@ -440,5 +724,76 @@ mod tests {
         let results = engine.search("+rust -java", 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "rust.txt");
+    }
+
+    #[test]
+    fn required_and_excluded_phrases_filter_results() {
+        let mut engine = SearchEngine::new();
+        engine.add_document(
+            "guide.txt",
+            "a search engine with phrase search and bm25 ranking",
+        );
+        engine.add_document("toy.txt", "a search engine toy example with phrase search");
+
+        let results = engine.search("+\"search engine\" -\"toy example\"", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "guide.txt");
+    }
+
+    #[test]
+    fn search_options_filter_results() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("guides/rust.txt", "rust search engine rust rust");
+        engine.add_document("notes/rust.txt", "rust search engine");
+
+        let results = engine.search_with_options(
+            "rust",
+            &SearchOptions::new(10)
+                .with_path_prefix("guides/")
+                .with_min_score(0.1),
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "guides/rust.txt");
+    }
+
+    #[test]
+    fn index_options_control_extensions_and_file_size() {
+        let dir = unique_temp_path("index_options");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("guide.md"), "search engine docs").unwrap();
+        fs::write(dir.join("lib.rs"), "rust search engine").unwrap();
+        fs::write(dir.join("large.txt"), "this file is definitely too large").unwrap();
+
+        let options = IndexOptions::default()
+            .with_extensions(["md", "rs", "txt"])
+            .with_max_file_size_bytes(20);
+        let engine = SearchEngine::build_from_directory_with_options(&dir, &options).unwrap();
+
+        assert_eq!(engine.document_count(), 2);
+        assert!(engine.documents().iter().any(|doc| doc.path == "guide.md"));
+        assert!(engine.documents().iter().any(|doc| doc.path == "lib.rs"));
+        assert!(!engine.documents().iter().any(|doc| doc.path == "large.txt"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn term_statistics_are_exposed() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("a.txt", "rust rust search");
+        engine.add_document("b.txt", "rust indexing");
+
+        assert_eq!(engine.document_frequency("Rust"), 2);
+        assert_eq!(engine.term_frequency(0, "rust"), 2);
+        assert!(engine.contains_term(1, "rust"));
+        assert_eq!(engine.top_terms(1)[0].term, "rust");
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("minisearch_{name}_{nanos}"))
     }
 }

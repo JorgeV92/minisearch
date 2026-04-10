@@ -1,18 +1,27 @@
-use minisearch::SearchEngine;
+use minisearch::{SearchEngine, SearchOptions};
 
 fn main() {
     let mut engine = SearchEngine::new();
     engine.add_document(
-        "project.txt",
+        "guides/project.txt",
         "A mini search engine in Rust with BM25 ranking and phrase search.",
     );
     engine.add_document(
-        "notes.txt",
+        "notes/distributed.txt",
         "This document talks about distributed systems and indexing.",
     );
 
-    let results = engine.search("rust \"phrase search\"", 10);
+    let results = engine.search_with_options(
+        "rust \"phrase search\"",
+        &SearchOptions::new(10).with_path_prefix("guides/"),
+    );
+
     for result in results {
-        println!("{} -> {:.3}", result.path, result.score);
+        println!(
+            "{} -> {:.3} [{}]",
+            result.path,
+            result.score,
+            result.matched_terms.join(", ")
+        );
     }
 }

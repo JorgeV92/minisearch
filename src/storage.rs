@@ -81,7 +81,9 @@ pub(crate) fn load_engine(path: &Path) -> Result<SearchEngine, SearchError> {
         .ok_or_else(|| SearchError::Parse("missing average-length line".to_string()))?;
     let avg_parts: Vec<&str> = avg_line.split('\t').collect();
     if avg_parts.len() != 2 || avg_parts[0] != "AVG" {
-        return Err(SearchError::Parse("invalid average-length line".to_string()));
+        return Err(SearchError::Parse(
+            "invalid average-length line".to_string(),
+        ));
     }
     let avg_doc_length = avg_parts[1]
         .parse::<f64>()
@@ -97,13 +99,13 @@ pub(crate) fn load_engine(path: &Path) -> Result<SearchEngine, SearchError> {
                 if parts.len() != 4 {
                     return Err(SearchError::Parse(format!("invalid DOC line: {line}")));
                 }
-                let id = parts[1]
-                    .parse::<usize>()
-                    .map_err(|_| SearchError::Parse(format!("invalid document id in line: {line}")))?;
+                let id = parts[1].parse::<usize>().map_err(|_| {
+                    SearchError::Parse(format!("invalid document id in line: {line}"))
+                })?;
                 let path = unescape_field(parts[2])?;
-                let length = parts[3]
-                    .parse::<usize>()
-                    .map_err(|_| SearchError::Parse(format!("invalid document length in line: {line}")))?;
+                let length = parts[3].parse::<usize>().map_err(|_| {
+                    SearchError::Parse(format!("invalid document length in line: {line}"))
+                })?;
                 documents.push(DocumentMeta::new(id, path, length));
             }
             Some("POST") => {
@@ -111,9 +113,9 @@ pub(crate) fn load_engine(path: &Path) -> Result<SearchEngine, SearchError> {
                     return Err(SearchError::Parse(format!("invalid POST line: {line}")));
                 }
                 let term = unescape_field(parts[1])?;
-                let doc_id = parts[2]
-                    .parse::<usize>()
-                    .map_err(|_| SearchError::Parse(format!("invalid posting doc id in line: {line}")))?;
+                let doc_id = parts[2].parse::<usize>().map_err(|_| {
+                    SearchError::Parse(format!("invalid posting doc id in line: {line}"))
+                })?;
                 let positions = if parts[3].is_empty() {
                     Vec::new()
                 } else {
@@ -143,7 +145,11 @@ pub(crate) fn load_engine(path: &Path) -> Result<SearchEngine, SearchError> {
         posting_list.sort_by_key(|posting| posting.doc_id);
     }
 
-    Ok(SearchEngine::from_parts(documents, postings, avg_doc_length))
+    Ok(SearchEngine::from_parts(
+        documents,
+        postings,
+        avg_doc_length,
+    ))
 }
 
 fn escape_field(input: &str) -> String {
@@ -221,4 +227,3 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 }
-

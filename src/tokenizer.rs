@@ -5,7 +5,7 @@ pub struct PositionedToken {
 }
 
 /// Tokenize text by:
-/// 
+///
 /// - lowercasing
 /// - splitting on non-alphanumeric chars
 /// - and keeping only non-empty tokens.

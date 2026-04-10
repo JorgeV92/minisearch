@@ -10,10 +10,9 @@ pub struct DocumentMeta {
 impl DocumentMeta {
     pub fn new(id: usize, path: impl Into<String>, length: usize) -> Self {
         Self {
-            id, 
+            id,
             path: path.into(),
             length,
         }
     }
 }
-
