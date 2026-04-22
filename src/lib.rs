@@ -5,6 +5,9 @@
 //! - recursive indexing for local files,
 //! - BM25-style ranking,
 //! - quoted phrase and proximity matching with positional postings,
+//! - fuzzy term matching for typo tolerance,
+//! - metadata filters like `ext:rs` and `path:src/`,
+//! - highlighted result snippets from stored document text,
 //! - configurable indexing and search filters,
 //! - and a simple persistence format for saving/loading indexes.
 //!
@@ -38,4 +41,6 @@ pub mod tokenizer;
 
 pub use document::DocumentMeta;
 pub use index::{IndexOptions, SearchEngine, SearchError, SearchOptions, SearchResult, TermStat};
-pub use query::{parse_query, ParsedQuery, PhraseQuery};
+pub use query::{
+    parse_query, FuzzyTermQuery, MetadataField, MetadataFilter, ParsedQuery, PhraseQuery,
+};

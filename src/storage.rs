@@ -3,9 +3,9 @@
 //! The on-disk format is intentionally simple and human-readable:
 //!
 //! ```text
-//! MSE1
+//! MSE3
 //! AVG\t3.500000
-//! DOC\t0\tREADME.md\t120
+//! DOC\t0\tREADME.md\t120\tDocument text content\tmd\tREADME\t1712793600
 //! POST\trust\t0\t0,9,42
 //! ```
 //!
@@ -17,19 +17,27 @@ use std::path::Path;
 use crate::document::DocumentMeta;
 use crate::index::{Posting, SearchEngine, SearchError};
 
-const MAGIC_HEADER: &str = "MSE1";
+const MAGIC_HEADER_V1: &str = "MSE1";
+const MAGIC_HEADER_V2: &str = "MSE2";
+const MAGIC_HEADER_V3: &str = "MSE3";
 
 pub(crate) fn save_engine(engine: &SearchEngine, path: &Path) -> Result<(), SearchError> {
     let mut lines = Vec::new();
-    lines.push(MAGIC_HEADER.to_string());
+    lines.push(MAGIC_HEADER_V3.to_string());
     lines.push(format!("AVG\t{:.12}", engine.average_document_length()));
 
     for doc in engine.documents() {
         lines.push(format!(
-            "DOC\t{}\t{}\t{}",
+            "DOC\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             doc.id,
             escape_field(&doc.path),
-            doc.length
+            doc.length,
+            escape_field(&doc.content),
+            escape_field(doc.extension.as_deref().unwrap_or("")),
+            escape_field(&doc.title),
+            doc.modified_unix_timestamp_secs
+                .map(|value| value.to_string())
+                .unwrap_or_default()
         ));
     }
 
@@ -70,11 +78,13 @@ pub(crate) fn load_engine(path: &Path) -> Result<SearchEngine, SearchError> {
     let header = lines
         .next()
         .ok_or_else(|| SearchError::Parse("missing file header".to_string()))?;
-    if header != MAGIC_HEADER {
+    if header != MAGIC_HEADER_V1 && header != MAGIC_HEADER_V2 && header != MAGIC_HEADER_V3 {
         return Err(SearchError::Parse(format!(
             "unsupported file header: {header}"
         )));
     }
+    let has_document_content = header == MAGIC_HEADER_V2 || header == MAGIC_HEADER_V3;
+    let has_full_metadata = header == MAGIC_HEADER_V3;
 
     let avg_line = lines
         .next()
@@ -96,7 +106,14 @@ pub(crate) fn load_engine(path: &Path) -> Result<SearchEngine, SearchError> {
         let parts: Vec<&str> = line.split('\t').collect();
         match parts.first().copied() {
             Some("DOC") => {
-                if parts.len() != 4 {
+                let expected_parts = if has_full_metadata {
+                    8
+                } else if has_document_content {
+                    5
+                } else {
+                    4
+                };
+                if parts.len() != expected_parts {
                     return Err(SearchError::Parse(format!("invalid DOC line: {line}")));
                 }
                 let id = parts[1].parse::<usize>().map_err(|_| {
@@ -106,7 +123,38 @@ pub(crate) fn load_engine(path: &Path) -> Result<SearchEngine, SearchError> {
                 let length = parts[3].parse::<usize>().map_err(|_| {
                     SearchError::Parse(format!("invalid document length in line: {line}"))
                 })?;
-                documents.push(DocumentMeta::new(id, path, length));
+                let content = if has_document_content {
+                    unescape_field(parts[4])?
+                } else {
+                    String::new()
+                };
+                let extension = if has_full_metadata {
+                    let value = unescape_field(parts[5])?;
+                    (!value.is_empty()).then_some(value)
+                } else {
+                    None
+                };
+                let title = if has_full_metadata {
+                    unescape_field(parts[6])?
+                } else {
+                    String::new()
+                };
+                let modified_unix_timestamp_secs = if has_full_metadata && !parts[7].is_empty() {
+                    Some(parts[7].parse::<u64>().map_err(|_| {
+                        SearchError::Parse(format!("invalid modified timestamp in line: {line}"))
+                    })?)
+                } else {
+                    None
+                };
+                documents.push(DocumentMeta::with_metadata(
+                    id,
+                    path,
+                    length,
+                    content,
+                    extension,
+                    title,
+                    modified_unix_timestamp_secs,
+                ));
             }
             Some("POST") => {
                 if parts.len() != 4 {
@@ -214,9 +262,59 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let mut engine = SearchEngine::new();
-        engine.add_document("a.txt", "rust rust bm25");
-        engine.add_document("b.txt", "search engine");
+        let engine = SearchEngine::from_parts(
+            vec![
+                DocumentMeta::with_metadata(
+                    0,
+                    "a.txt",
+                    3,
+                    "rust rust bm25",
+                    Some("txt".to_string()),
+                    "Alpha Guide",
+                    Some(1_700_000_000),
+                ),
+                DocumentMeta::with_metadata(
+                    1,
+                    "b.txt",
+                    2,
+                    "search engine",
+                    Some("txt".to_string()),
+                    "Beta Guide",
+                    None,
+                ),
+            ],
+            HashMap::from([
+                (
+                    "bm25".to_string(),
+                    vec![Posting {
+                        doc_id: 0,
+                        positions: vec![2],
+                    }],
+                ),
+                (
+                    "engine".to_string(),
+                    vec![Posting {
+                        doc_id: 1,
+                        positions: vec![1],
+                    }],
+                ),
+                (
+                    "rust".to_string(),
+                    vec![Posting {
+                        doc_id: 0,
+                        positions: vec![0, 1],
+                    }],
+                ),
+                (
+                    "search".to_string(),
+                    vec![Posting {
+                        doc_id: 1,
+                        positions: vec![0],
+                    }],
+                ),
+            ]),
+            2.5,
+        );
 
         let path = std::env::temp_dir().join("mini_search_engine_roundtrip.idx");
         save_engine(&engine, &path).unwrap();
@@ -224,6 +322,62 @@ mod tests {
 
         assert_eq!(loaded.document_count(), 2);
         assert_eq!(loaded.vocabulary_size(), engine.vocabulary_size());
+        assert_eq!(loaded.document(0).unwrap().content, "rust rust bm25");
+        assert_eq!(
+            loaded.document(0).unwrap().extension.as_deref(),
+            Some("txt")
+        );
+        assert_eq!(loaded.document(0).unwrap().title, "Alpha Guide");
+        assert_eq!(
+            loaded.document(0).unwrap().modified_unix_timestamp_secs,
+            Some(1_700_000_000)
+        );
+        let results = loaded.search("bm25", 5);
+        let snippet = results[0].snippet.as_deref().unwrap();
+        assert!(snippet.contains("[[bm25]]"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_engine_supports_legacy_v1_indexes() {
+        let path = std::env::temp_dir().join("mini_search_engine_legacy.idx");
+        fs::write(
+            &path,
+            "MSE1\nAVG\t2.000000000000\nDOC\t0\ta.txt\t2\nPOST\trust\t0\t0\n",
+        )
+        .unwrap();
+
+        let loaded = load_engine(&path).unwrap();
+
+        assert_eq!(loaded.document_count(), 1);
+        assert_eq!(loaded.document(0).unwrap().content, "");
+        assert_eq!(
+            loaded.document(0).unwrap().extension.as_deref(),
+            Some("txt")
+        );
+        assert_eq!(loaded.document(0).unwrap().title, "a");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_engine_supports_legacy_v2_indexes() {
+        let path = std::env::temp_dir().join("mini_search_engine_legacy_v2.idx");
+        fs::write(
+            &path,
+            "MSE2\nAVG\t2.000000000000\nDOC\t0\tguide.md\t2\t# Guide\nPOST\tguide\t0\t1\n",
+        )
+        .unwrap();
+
+        let loaded = load_engine(&path).unwrap();
+
+        assert_eq!(loaded.document_count(), 1);
+        assert_eq!(loaded.document(0).unwrap().content, "# Guide");
+        assert_eq!(loaded.document(0).unwrap().extension.as_deref(), Some("md"));
+        assert_eq!(loaded.document(0).unwrap().title, "Guide");
+        assert_eq!(
+            loaded.document(0).unwrap().modified_unix_timestamp_secs,
+            None
+        );
         let _ = fs::remove_file(path);
     }
 }

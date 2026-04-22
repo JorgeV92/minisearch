@@ -1,6 +1,6 @@
 # minisearch
 
-`minisearch` is a small Rust search engine crate and CLI for indexing local text content with an inverted index, BM25-style scoring, phrase and proximity matching, and on-disk persistence.
+`minisearch` is a small Rust search engine crate and CLI for indexing local text content with an inverted index, BM25-style scoring, phrase, proximity, and fuzzy matching, metadata filters, highlighted snippets, and on-disk persistence.
 
 ## Features
 
@@ -10,6 +10,9 @@
 - BM25-style ranking for term queries
 - Phrase search with quoted queries like `"distributed systems"`
 - Proximity search with slop syntax like `"distributed systems"~3`
+- Fuzzy search with typo-tolerant term syntax like `serch~1`
+- Metadata filters like `ext:rs`, `path:guides/`, and `title:search`
+- Highlighted snippets with `[[...]]` markers around matched text
 - Required and excluded terms or phrases via `+term`, `-term`, `+"phrase"`, and `-"phrase"`
 - Search-time filters for path prefixes and minimum score thresholds
 - Simple save/load support for persisting an index to disk
@@ -44,7 +47,7 @@ fn main() {
     );
 
     let results = engine.search_with_options(
-        "rust +\"phrase search\"",
+        "path:guides/ ext:txt rust serch~1 +\"phrase search\"",
         &SearchOptions::new(10).with_path_prefix("guides/"),
     );
 
@@ -55,6 +58,9 @@ fn main() {
             result.score,
             result.matched_terms.join(", ")
         );
+        if let Some(snippet) = result.snippet {
+            println!("snippet: {snippet}");
+        }
     }
 }
 ```
@@ -66,6 +72,10 @@ fn main() {
 | `rust bm25` | Optional terms ranked by BM25 | `rust bm25` |
 | `+rust` | Required term | `+rust search` |
 | `-java` | Excluded term | `rust -java` |
+| `serch~1` | Fuzzy term match within edit distance 1 | `serch~1` |
+| `ext:rs` | Required extension filter | `ext:rs` |
+| `path:guides/` | Required path-prefix filter | `path:guides/` |
+| `title:search` | Required title-term filter | `title:search` |
 | `"phrase search"` | Phrase boost / phrase-only search | `"phrase search"` |
 | `"distributed systems"~3` | Ordered proximity search with up to 3 extra tokens between terms | `"distributed systems"~3` |
 | `+"phrase search"` | Required phrase | `rust +"phrase search"` |
@@ -76,8 +86,11 @@ Notes:
 - Optional terms contribute score when they appear.
 - Required terms and required phrases must match for a document to be returned.
 - Excluded terms and phrases remove a document from the result set.
+- Fuzzy terms use `term~N` and match indexed terms within edit distance `N`.
+- Metadata filters default to required; use `-ext:md`, `-path:notes/`, or `-title:generated` to exclude.
 - Phrase-only queries work even when no standalone terms are present.
 - Proximity phrases preserve term order and allow up to `N` extra intervening tokens.
+- Search results include an optional highlighted snippet built from the original stored document text.
 
 ## Library API
 
@@ -192,16 +205,20 @@ Run any example with `cargo run --example <name>`.
 - `SearchOptions`: search-time filters like `top_k`, `path_prefix`, and `min_score`
 - `IndexOptions`: directory indexing controls for extensions and max file size
 - `SearchResult`: a matched document with score and matched terms
+  `snippet` contains a highlighted excerpt using `[[...]]` markers when source content is available.
 - `TermStat`: aggregated term statistics for reporting
-- `ParsedQuery` / `PhraseQuery`: parsed query structures if you want to inspect or cache queries
+- `ParsedQuery` / `PhraseQuery` / `FuzzyTermQuery` / `MetadataFilter`: parsed query structures if you want to inspect or cache queries
 
 ## Persistence Format
 
-Indexes are stored in a plain-text format that begins with the `MSE1` header and records:
+Indexes are stored in a plain-text format that begins with the `MSE3` header and records:
 
 - average document length
-- document metadata
+- document metadata including extension, title, and modified timestamp
+- original content for snippet generation
 - positional postings for each term
+
+Older `MSE1` and `MSE2` indexes still load. Legacy indexes derive missing metadata from the stored path/content, and `MSE1` results still lack snippets because those files never stored original content.
 
 <!-- ## Development
 

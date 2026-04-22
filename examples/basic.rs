@@ -23,5 +23,8 @@ fn main() {
             result.score,
             result.matched_terms.join(", ")
         );
+        if let Some(snippet) = result.snippet {
+            println!("   {snippet}");
+        }
     }
 }

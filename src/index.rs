@@ -5,14 +5,18 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use crate::document::DocumentMeta;
-use crate::query::{parse_query, ParsedQuery, PhraseQuery};
+use crate::query::{
+    parse_query, FuzzyTermQuery, MetadataField, MetadataFilter, ParsedQuery, PhraseQuery,
+};
 use crate::storage;
-use crate::tokenizer::{tokenize, tokenize_with_positions};
+use crate::tokenizer::{tokenize, tokenize_with_positions, PositionedToken};
 
 const BM25_K1: f64 = 1.5;
 const BM25_B: f64 = 0.75;
+const DEFAULT_SNIPPET_MAX_CHARS: usize = 160;
 
 /// A positional posting for a term in one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +31,18 @@ impl Posting {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FuzzyMatch {
+    term: String,
+    distance: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFuzzyTerm {
+    query: FuzzyTermQuery,
+    matches: Vec<FuzzyMatch>,
+}
+
 /// One search result returned by the engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -34,6 +50,7 @@ pub struct SearchResult {
     pub path: String,
     pub score: f64,
     pub matched_terms: Vec<String>,
+    pub snippet: Option<String>,
 }
 
 /// Aggregate statistics for one term in the vocabulary.
@@ -270,6 +287,15 @@ impl SearchEngine {
 
     /// Adds one document to the engine.
     pub fn add_document(&mut self, path: impl Into<String>, content: &str) {
+        self.add_document_with_metadata(path, content, None);
+    }
+
+    fn add_document_with_metadata(
+        &mut self,
+        path: impl Into<String>,
+        content: &str,
+        modified_unix_timestamp_secs: Option<u64>,
+    ) {
         let path = path.into();
         let doc_id = self.documents.len();
         let tokens = tokenize_with_positions(content);
@@ -290,7 +316,15 @@ impl SearchEngine {
                 .push(Posting { doc_id, positions });
         }
 
-        self.documents.push(DocumentMeta::new(doc_id, path, length));
+        self.documents.push(DocumentMeta::with_metadata(
+            doc_id,
+            path,
+            length,
+            content,
+            None,
+            String::new(),
+            modified_unix_timestamp_secs,
+        ));
         self.recompute_average_length();
     }
 
@@ -353,11 +387,20 @@ impl SearchEngine {
             }
 
             let content = fs::read_to_string(&file)?;
+            let modified_unix_timestamp_secs = fs::metadata(&file)?
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_secs());
             let relative = file
                 .strip_prefix(&base)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|_| file.clone());
-            self.add_document(relative.display().to_string(), &content);
+            self.add_document_with_metadata(
+                relative.display().to_string(),
+                &content,
+                modified_unix_timestamp_secs,
+            );
         }
 
         Ok(self.document_count() - start_count)
@@ -396,6 +439,23 @@ impl SearchEngine {
 
         let mut scores: HashMap<usize, f64> = HashMap::new();
         let mut matched_terms: HashMap<usize, HashSet<String>> = HashMap::new();
+        let mut matched_token_terms: HashMap<usize, HashSet<String>> = HashMap::new();
+
+        let resolved_optional_fuzzy = parsed
+            .optional_fuzzy_terms
+            .iter()
+            .map(|query| self.resolve_fuzzy_term(query))
+            .collect::<Vec<_>>();
+        let resolved_required_fuzzy = parsed
+            .required_fuzzy_terms
+            .iter()
+            .map(|query| self.resolve_fuzzy_term(query))
+            .collect::<Vec<_>>();
+        let resolved_excluded_fuzzy = parsed
+            .excluded_fuzzy_terms
+            .iter()
+            .map(|query| self.resolve_fuzzy_term(query))
+            .collect::<Vec<_>>();
 
         let scoring_terms = parsed
             .optional_terms
@@ -414,14 +474,55 @@ impl SearchEngine {
                     .entry(posting.doc_id)
                     .or_default()
                     .insert(term.clone());
+                matched_token_terms
+                    .entry(posting.doc_id)
+                    .or_default()
+                    .insert(term.clone());
             }
         }
 
-        let has_scoring_terms =
-            !parsed.optional_terms.is_empty() || !parsed.required_terms.is_empty();
+        for fuzzy_term in resolved_optional_fuzzy
+            .iter()
+            .chain(resolved_required_fuzzy.iter())
+        {
+            for candidate in &fuzzy_term.matches {
+                let Some(postings) = self.postings.get(&candidate.term) else {
+                    continue;
+                };
+                let document_frequency = postings.len();
+                let score_multiplier = fuzzy_score_multiplier(candidate.distance);
+                for posting in postings {
+                    let score = self.bm25_score(
+                        posting.doc_id,
+                        posting.term_frequency(),
+                        document_frequency,
+                    ) * score_multiplier;
+                    *scores.entry(posting.doc_id).or_insert(0.0) += score;
+                    matched_terms
+                        .entry(posting.doc_id)
+                        .or_default()
+                        .insert(candidate.term.clone());
+                    matched_token_terms
+                        .entry(posting.doc_id)
+                        .or_default()
+                        .insert(candidate.term.clone());
+                }
+            }
+        }
+
+        let has_scoring_terms = !parsed.optional_terms.is_empty()
+            || !parsed.required_terms.is_empty()
+            || !parsed.optional_fuzzy_terms.is_empty()
+            || !parsed.required_fuzzy_terms.is_empty();
         let has_scoring_phrases = !parsed.phrases.is_empty() || !parsed.required_phrases.is_empty();
-        let phrase_only_mode = has_scoring_phrases && !has_scoring_terms;
-        if phrase_only_mode {
+        let has_filter_only_clauses = !parsed.excluded_terms.is_empty()
+            || !parsed.excluded_fuzzy_terms.is_empty()
+            || !parsed.excluded_phrases.is_empty()
+            || !parsed.required_metadata_filters.is_empty()
+            || !parsed.excluded_metadata_filters.is_empty();
+        let needs_full_doc_seed =
+            !has_scoring_terms && (has_scoring_phrases || has_filter_only_clauses);
+        if needs_full_doc_seed {
             for doc in &self.documents {
                 scores.entry(doc.id).or_insert(0.0);
             }
@@ -445,7 +546,20 @@ impl SearchEngine {
             if !self.satisfies_required_terms(doc_id, &parsed.required_terms) {
                 continue;
             }
+            if !self.satisfies_required_fuzzy_terms(doc_id, &resolved_required_fuzzy) {
+                continue;
+            }
             if self.matches_any_excluded_term(doc_id, &parsed.excluded_terms) {
+                continue;
+            }
+            if self.matches_any_excluded_fuzzy_terms(doc_id, &resolved_excluded_fuzzy) {
+                continue;
+            }
+            if !self.satisfies_metadata_filters(doc_id, &parsed.required_metadata_filters) {
+                continue;
+            }
+            if self.matches_any_excluded_metadata_filters(doc_id, &parsed.excluded_metadata_filters)
+            {
                 continue;
             }
             if !self.satisfies_required_phrases(doc_id, &parsed.required_phrases) {
@@ -454,7 +568,8 @@ impl SearchEngine {
             if self.matches_any_excluded_phrases(doc_id, &parsed.excluded_phrases) {
                 continue;
             }
-            if phrase_only_mode
+            if !has_scoring_terms
+                && has_scoring_phrases
                 && !parsed
                     .phrases
                     .iter()
@@ -476,6 +591,7 @@ impl SearchEngine {
                 }
             }
 
+            let highlight_terms = matched_token_terms.remove(&doc_id).unwrap_or_default();
             let mut terms = matched_terms
                 .remove(&doc_id)
                 .unwrap_or_default()
@@ -511,6 +627,7 @@ impl SearchEngine {
                 path,
                 score,
                 matched_terms: terms,
+                snippet: self.build_snippet(doc_id, parsed, &highlight_terms),
             });
         }
 
@@ -585,10 +702,58 @@ impl SearchEngine {
             .all(|term| self.contains_normalized_term(doc_id, term))
     }
 
+    fn satisfies_required_fuzzy_terms(
+        &self,
+        doc_id: usize,
+        required_terms: &[ResolvedFuzzyTerm],
+    ) -> bool {
+        required_terms.iter().all(|query| {
+            query
+                .matches
+                .iter()
+                .any(|candidate| self.contains_normalized_term(doc_id, &candidate.term))
+        })
+    }
+
     fn matches_any_excluded_term(&self, doc_id: usize, excluded_terms: &[String]) -> bool {
         excluded_terms
             .iter()
             .any(|term| self.contains_normalized_term(doc_id, term))
+    }
+
+    fn matches_any_excluded_fuzzy_terms(
+        &self,
+        doc_id: usize,
+        excluded_terms: &[ResolvedFuzzyTerm],
+    ) -> bool {
+        excluded_terms.iter().any(|query| {
+            query
+                .matches
+                .iter()
+                .any(|candidate| self.contains_normalized_term(doc_id, &candidate.term))
+        })
+    }
+
+    fn satisfies_metadata_filters(&self, doc_id: usize, filters: &[MetadataFilter]) -> bool {
+        let Some(document) = self.documents.get(doc_id) else {
+            return false;
+        };
+        filters
+            .iter()
+            .all(|filter| document_matches_metadata_filter(document, filter))
+    }
+
+    fn matches_any_excluded_metadata_filters(
+        &self,
+        doc_id: usize,
+        filters: &[MetadataFilter],
+    ) -> bool {
+        let Some(document) = self.documents.get(doc_id) else {
+            return false;
+        };
+        filters
+            .iter()
+            .any(|filter| document_matches_metadata_filter(document, filter))
     }
 
     fn satisfies_required_phrases(&self, doc_id: usize, required_phrases: &[PhraseQuery]) -> bool {
@@ -659,6 +824,63 @@ impl SearchEngine {
 
         best_match
     }
+
+    fn build_snippet(
+        &self,
+        doc_id: usize,
+        parsed: &ParsedQuery,
+        matched_token_terms: &HashSet<String>,
+    ) -> Option<String> {
+        let content = &self.documents.get(doc_id)?.content;
+        if content.is_empty() {
+            return None;
+        }
+
+        let tokens = tokenize_with_positions(content);
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut ranges = collect_match_ranges(&tokens, parsed, matched_token_terms);
+        if ranges.is_empty() {
+            return None;
+        }
+
+        merge_ranges(&mut ranges);
+        let snippet_range = choose_snippet_range(content, ranges[0], DEFAULT_SNIPPET_MAX_CHARS);
+        let visible_ranges = clip_ranges(&ranges, snippet_range);
+        Some(render_highlighted_snippet(
+            content,
+            snippet_range,
+            &visible_ranges,
+        ))
+    }
+
+    fn resolve_fuzzy_term(&self, query: &FuzzyTermQuery) -> ResolvedFuzzyTerm {
+        let mut matches = self
+            .postings
+            .keys()
+            .filter_map(|term| {
+                bounded_levenshtein(&query.term, term, query.max_distance).map(|distance| {
+                    FuzzyMatch {
+                        term: term.clone(),
+                        distance,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| {
+            left.distance
+                .cmp(&right.distance)
+                .then_with(|| left.term.cmp(&right.term))
+        });
+
+        ResolvedFuzzyTerm {
+            query: query.clone(),
+            matches,
+        }
+    }
 }
 
 fn normalize_single_term(term: &str) -> Option<String> {
@@ -667,6 +889,23 @@ fn normalize_single_term(term: &str) -> Option<String> {
         tokens.pop()
     } else {
         None
+    }
+}
+
+fn document_matches_metadata_filter(document: &DocumentMeta, filter: &MetadataFilter) -> bool {
+    match filter.field {
+        MetadataField::Extension => document.extension.as_deref() == Some(filter.value.as_str()),
+        MetadataField::Path => document.path.starts_with(&filter.value),
+        MetadataField::Title => {
+            let title_terms = tokenize(&document.title);
+            let filter_terms = tokenize(&filter.value);
+            if filter_terms.is_empty() {
+                return false;
+            }
+            filter_terms
+                .iter()
+                .all(|term| title_terms.iter().any(|candidate| candidate == term))
+        }
     }
 }
 
@@ -692,6 +931,295 @@ fn is_supported_file(path: &Path, extensions: &HashSet<String>) -> bool {
         return false;
     };
     extensions.contains(&extension.to_ascii_lowercase())
+}
+
+fn collect_match_ranges(
+    tokens: &[PositionedToken],
+    parsed: &ParsedQuery,
+    matched_token_terms: &HashSet<String>,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+
+    for term in matched_token_terms {
+        for token in tokens.iter().filter(|token| token.term == *term) {
+            ranges.push((token.start, token.end));
+        }
+    }
+
+    for phrase in parsed.phrases.iter().chain(parsed.required_phrases.iter()) {
+        ranges.extend(collect_phrase_ranges(tokens, phrase));
+    }
+
+    ranges
+}
+
+fn collect_phrase_ranges(tokens: &[PositionedToken], phrase: &PhraseQuery) -> Vec<(usize, usize)> {
+    if phrase.terms.is_empty() {
+        return Vec::new();
+    }
+
+    if phrase.terms.len() == 1 {
+        return tokens
+            .iter()
+            .filter(|token| token.term == phrase.terms[0])
+            .map(|token| (token.start, token.end))
+            .collect();
+    }
+
+    let mut position_lists = Vec::with_capacity(phrase.terms.len());
+    for term in &phrase.terms {
+        let positions = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| (token.term == *term).then_some(index))
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            return Vec::new();
+        }
+        position_lists.push(positions);
+    }
+
+    let mut matches = Vec::new();
+    for &start_index in &position_lists[0] {
+        collect_phrase_match_ranges(
+            &position_lists,
+            1,
+            start_index,
+            0,
+            phrase.slop,
+            start_index,
+            &mut matches,
+        );
+    }
+
+    matches
+        .into_iter()
+        .map(|(start_index, end_index)| (tokens[start_index].start, tokens[end_index].end))
+        .collect()
+}
+
+fn collect_phrase_match_ranges(
+    position_lists: &[Vec<usize>],
+    term_index: usize,
+    previous_position: usize,
+    used_slop: usize,
+    max_slop: usize,
+    start_position: usize,
+    matches: &mut Vec<(usize, usize)>,
+) {
+    if term_index == position_lists.len() {
+        matches.push((start_position, previous_position));
+        return;
+    }
+
+    for &position in &position_lists[term_index] {
+        if position <= previous_position {
+            continue;
+        }
+
+        let next_slop = used_slop + (position - previous_position - 1);
+        if next_slop > max_slop {
+            break;
+        }
+
+        collect_phrase_match_ranges(
+            position_lists,
+            term_index + 1,
+            position,
+            next_slop,
+            max_slop,
+            start_position,
+            matches,
+        );
+    }
+}
+
+fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut merged = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges.iter() {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    *ranges = merged;
+}
+
+fn clip_ranges(ranges: &[(usize, usize)], snippet_range: (usize, usize)) -> Vec<(usize, usize)> {
+    let (snippet_start, snippet_end) = snippet_range;
+    ranges
+        .iter()
+        .filter_map(|&(start, end)| {
+            let clipped_start = start.max(snippet_start);
+            let clipped_end = end.min(snippet_end);
+            (clipped_start < clipped_end).then_some((clipped_start, clipped_end))
+        })
+        .collect()
+}
+
+fn choose_snippet_range(
+    content: &str,
+    anchor_range: (usize, usize),
+    max_chars: usize,
+) -> (usize, usize) {
+    let target = max_chars.max(anchor_range.1.saturating_sub(anchor_range.0));
+    let extra = target.saturating_sub(anchor_range.1.saturating_sub(anchor_range.0));
+    let left_context = extra / 2;
+    let right_context = extra - left_context;
+
+    let mut start = anchor_range.0.saturating_sub(left_context);
+    let mut end = (anchor_range.1 + right_context).min(content.len());
+
+    let current_len = end.saturating_sub(start);
+    if current_len < target {
+        let missing = target - current_len;
+        let extend_left = missing.min(start);
+        start -= extend_left;
+        end = (end + (missing - extend_left)).min(content.len());
+    }
+
+    start = clamp_to_char_boundary_left(content, start);
+    end = clamp_to_char_boundary_right(content, end);
+    start = trim_leading_whitespace(content, start, end);
+    end = trim_trailing_whitespace(content, start, end);
+
+    (start, end)
+}
+
+fn render_highlighted_snippet(
+    content: &str,
+    snippet_range: (usize, usize),
+    highlight_ranges: &[(usize, usize)],
+) -> String {
+    let (snippet_start, snippet_end) = snippet_range;
+    let mut snippet = String::new();
+    if snippet_start > 0 {
+        snippet.push_str("...");
+    }
+
+    let mut range_index = 0usize;
+    let mut in_highlight = false;
+    let mut last_was_space = false;
+
+    for (offset, ch) in content[snippet_start..snippet_end].char_indices() {
+        let global_start = snippet_start + offset;
+        let global_end = global_start + ch.len_utf8();
+
+        if range_index < highlight_ranges.len() && highlight_ranges[range_index].0 == global_start {
+            snippet.push_str("[[");
+            in_highlight = true;
+        }
+
+        if ch.is_whitespace() {
+            if !last_was_space {
+                snippet.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            snippet.push(ch);
+            last_was_space = false;
+        }
+
+        if in_highlight
+            && range_index < highlight_ranges.len()
+            && highlight_ranges[range_index].1 == global_end
+        {
+            snippet.push_str("]]");
+            in_highlight = false;
+            range_index += 1;
+        }
+    }
+
+    if in_highlight {
+        snippet.push_str("]]");
+    }
+    if snippet_end < content.len() {
+        snippet.push_str("...");
+    }
+
+    snippet.trim().to_string()
+}
+
+fn clamp_to_char_boundary_left(content: &str, mut index: usize) -> usize {
+    index = index.min(content.len());
+    while index > 0 && !content.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn clamp_to_char_boundary_right(content: &str, mut index: usize) -> usize {
+    index = index.min(content.len());
+    while index < content.len() && !content.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn trim_leading_whitespace(content: &str, mut start: usize, end: usize) -> usize {
+    while start < end {
+        let ch = content[start..end].chars().next().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+    start
+}
+
+fn trim_trailing_whitespace(content: &str, start: usize, mut end: usize) -> usize {
+    while end > start {
+        let ch = content[start..end].chars().next_back().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+    end
+}
+
+fn fuzzy_score_multiplier(distance: usize) -> f64 {
+    1.0 / (1.0 + distance as f64)
+}
+
+fn bounded_levenshtein(left: &str, right: &str, max_distance: usize) -> Option<usize> {
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+
+    if left_chars.len().abs_diff(right_chars.len()) > max_distance {
+        return None;
+    }
+
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left_chars.iter().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_min = current[0];
+
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution_cost = usize::from(left_char != right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution_cost);
+            row_min = row_min.min(current[right_index + 1]);
+        }
+
+        if row_min > max_distance {
+            return None;
+        }
+
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    let distance = previous[right_chars.len()];
+    (distance <= max_distance).then_some(distance)
 }
 
 fn find_phrase_match_with_slop(
@@ -778,6 +1306,88 @@ mod tests {
         assert_eq!(proximity_results.len(), 2);
         assert_eq!(proximity_results[0].path, "exact.txt");
         assert_eq!(proximity_results[1].path, "near.txt");
+    }
+
+    #[test]
+    fn fuzzy_search_matches_typos_and_prefers_exact_hits() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("exact.txt", "search engine");
+        engine.add_document("fuzzy.txt", "serch engine");
+
+        let results = engine.search("serch~1", 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].path, "fuzzy.txt");
+        assert_eq!(results[1].path, "exact.txt");
+        assert!(results[1].matched_terms.iter().any(|term| term == "search"));
+    }
+
+    #[test]
+    fn required_and_excluded_fuzzy_terms_filter_results() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("guide.txt", "rust tokenizer guide");
+        engine.add_document("mixed.txt", "rust tokeniser guide java");
+        engine.add_document("other.txt", "rust parsing guide");
+
+        let results = engine.search("+tokenzier~2 -jave~1 rust", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "guide.txt");
+    }
+
+    #[test]
+    fn metadata_filters_match_extension_path_and_title() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("guides/rust_intro.md", "# Rust Search\nbody");
+        engine.add_document("guides/generated.rs", "pub fn generated() {}");
+        engine.add_document("notes/rust.txt", "rust notes");
+
+        let extension_results = engine.search("ext:md", 10);
+        assert_eq!(extension_results.len(), 1);
+        assert_eq!(extension_results[0].path, "guides/rust_intro.md");
+
+        let path_results = engine.search("path:guides/", 10);
+        assert_eq!(path_results.len(), 2);
+
+        let title_results = engine.search("title:search", 10);
+        assert_eq!(title_results.len(), 1);
+        assert_eq!(title_results[0].path, "guides/rust_intro.md");
+    }
+
+    #[test]
+    fn metadata_filters_can_exclude_results() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("guides/search.md", "# Search Guide\nbody");
+        engine.add_document("guides/generated.rs", "pub fn generated() {}");
+
+        let results = engine.search("path:guides/ -ext:rs -title:generated", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "guides/search.md");
+    }
+
+    #[test]
+    fn search_results_include_highlighted_snippets() {
+        let mut engine = SearchEngine::new();
+        engine.add_document(
+            "guide.txt",
+            "Rust search-engine results can show snippets and highlighting.",
+        );
+
+        let results = engine.search("\"search engine\" rust", 10);
+        let snippet = results[0].snippet.as_deref().unwrap();
+        assert!(snippet.contains("[[Rust]]"));
+        assert!(snippet.contains("[[search-engine]]"));
+    }
+
+    #[test]
+    fn fuzzy_matches_are_highlighted_in_snippets() {
+        let mut engine = SearchEngine::new();
+        engine.add_document(
+            "guide.txt",
+            "The tokenizer supports search suggestions and typo correction.",
+        );
+
+        let results = engine.search("serch~1", 10);
+        let snippet = results[0].snippet.as_deref().unwrap();
+        assert!(snippet.contains("[[search]]"));
     }
 
     #[test]

@@ -89,6 +89,9 @@ fn run_search(bin_name: &str, args: &[String]) -> Result<(), Box<dyn std::error:
         if !result.matched_terms.is_empty() {
             println!("   matched: {}", result.matched_terms.join(", "));
         }
+        if let Some(snippet) = &result.snippet {
+            println!("   snippet: {snippet}");
+        }
     }
 
     Ok(())
@@ -160,6 +163,9 @@ fn run_demo() {
             result.score,
             result.matched_terms.join(", ")
         );
+        if let Some(snippet) = &result.snippet {
+            println!("   {snippet}");
+        }
     }
 }
 
