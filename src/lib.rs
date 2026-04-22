@@ -4,7 +4,7 @@
 //!
 //! - recursive indexing for local files,
 //! - BM25-style ranking,
-//! - quoted phrase matching with positional postings,
+//! - quoted phrase and proximity matching with positional postings,
 //! - configurable indexing and search filters,
 //! - and a simple persistence format for saving/loading indexes.
 //!

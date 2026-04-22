@@ -1,6 +1,6 @@
 # minisearch
 
-`minisearch` is a small Rust search engine crate and CLI for indexing local text content with an inverted index, BM25-style scoring, phrase matching, and on-disk persistence.
+`minisearch` is a small Rust search engine crate and CLI for indexing local text content with an inverted index, BM25-style scoring, phrase and proximity matching, and on-disk persistence.
 
 ## Features
 
@@ -9,6 +9,7 @@
 - Lowercased alphanumeric tokenization with positional postings
 - BM25-style ranking for term queries
 - Phrase search with quoted queries like `"distributed systems"`
+- Proximity search with slop syntax like `"distributed systems"~3`
 - Required and excluded terms or phrases via `+term`, `-term`, `+"phrase"`, and `-"phrase"`
 - Search-time filters for path prefixes and minimum score thresholds
 - Simple save/load support for persisting an index to disk
@@ -66,6 +67,7 @@ fn main() {
 | `+rust` | Required term | `+rust search` |
 | `-java` | Excluded term | `rust -java` |
 | `"phrase search"` | Phrase boost / phrase-only search | `"phrase search"` |
+| `"distributed systems"~3` | Ordered proximity search with up to 3 extra tokens between terms | `"distributed systems"~3` |
 | `+"phrase search"` | Required phrase | `rust +"phrase search"` |
 | `-"toy example"` | Excluded phrase | `rust -"toy example"` |
 
@@ -75,6 +77,7 @@ Notes:
 - Required terms and required phrases must match for a document to be returned.
 - Excluded terms and phrases remove a document from the result set.
 - Phrase-only queries work even when no standalone terms are present.
+- Proximity phrases preserve term order and allow up to `N` extra intervening tokens.
 
 ## Library API
 

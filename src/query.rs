@@ -5,6 +5,7 @@ use crate::tokenizer::tokenize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhraseQuery {
     pub terms: Vec<String>,
+    pub slop: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -45,17 +46,18 @@ pub fn parse_query(input: &str) -> ParsedQuery {
                 i += 1;
             }
             let phrase_text: String = chars[start..i].iter().collect();
+            if i < chars.len() && chars[i] == '"' {
+                i += 1;
+            }
+            let slop = parse_phrase_slop(&chars, &mut i);
             let terms = tokenize(&phrase_text);
             if !terms.is_empty() {
-                let phrase = PhraseQuery { terms };
+                let phrase = PhraseQuery { terms, slop };
                 match prefix {
                     '+' => parsed.required_phrases.push(phrase),
                     '-' => parsed.excluded_phrases.push(phrase),
                     _ => parsed.phrases.push(phrase),
                 }
-            }
-            if i < chars.len() && chars[i] == '"' {
-                i += 1;
             }
             continue;
         }
@@ -82,6 +84,24 @@ pub fn parse_query(input: &str) -> ParsedQuery {
     parsed
 }
 
+fn parse_phrase_slop(chars: &[char], index: &mut usize) -> usize {
+    if *index >= chars.len() || chars[*index] != '~' {
+        return 0;
+    }
+
+    *index += 1;
+    let mut slop = 0usize;
+    while *index < chars.len() {
+        let Some(digit) = chars[*index].to_digit(10) else {
+            break;
+        };
+        slop = slop.saturating_mul(10).saturating_add(digit as usize);
+        *index += 1;
+    }
+
+    slop
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,14 +112,51 @@ mod tests {
         assert_eq!(parsed.required_terms, vec!["rust"]);
         assert_eq!(parsed.excluded_terms, vec!["java"]);
         assert_eq!(parsed.optional_terms, vec!["bm25"]);
-        assert_eq!(parsed.phrases[0].terms, vec!["search", "engine"]);
+        assert_eq!(
+            parsed.phrases[0],
+            PhraseQuery {
+                terms: vec!["search".to_string(), "engine".to_string()],
+                slop: 0,
+            }
+        );
     }
 
     #[test]
     fn parse_required_and_excluded_phrases() {
         let parsed = parse_query("+\"search engine\" -\"toy example\"");
         assert!(parsed.phrases.is_empty());
-        assert_eq!(parsed.required_phrases[0].terms, vec!["search", "engine"]);
-        assert_eq!(parsed.excluded_phrases[0].terms, vec!["toy", "example"]);
+        assert_eq!(
+            parsed.required_phrases[0],
+            PhraseQuery {
+                terms: vec!["search".to_string(), "engine".to_string()],
+                slop: 0,
+            }
+        );
+        assert_eq!(
+            parsed.excluded_phrases[0],
+            PhraseQuery {
+                terms: vec!["toy".to_string(), "example".to_string()],
+                slop: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_proximity_phrases() {
+        let parsed = parse_query("+\"distributed systems\"~3 -\"toy example\"~1");
+        assert_eq!(
+            parsed.required_phrases[0],
+            PhraseQuery {
+                terms: vec!["distributed".to_string(), "systems".to_string()],
+                slop: 3,
+            }
+        );
+        assert_eq!(
+            parsed.excluded_phrases[0],
+            PhraseQuery {
+                terms: vec!["toy".to_string(), "example".to_string()],
+                slop: 1,
+            }
+        );
     }
 }

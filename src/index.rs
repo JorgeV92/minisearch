@@ -429,8 +429,8 @@ impl SearchEngine {
 
         for phrase in parsed.phrases.iter().chain(parsed.required_phrases.iter()) {
             for doc in &self.documents {
-                if self.doc_has_phrase(doc.id, phrase) {
-                    let boost = 2.0 * phrase.terms.len() as f64;
+                if let Some(used_slop) = self.phrase_match_slop(doc.id, phrase) {
+                    let boost = phrase_boost(phrase, used_slop);
                     *scores.entry(doc.id).or_insert(0.0) += boost;
                     matched_terms
                         .entry(doc.id)
@@ -624,35 +624,40 @@ impl SearchEngine {
     }
 
     fn doc_has_phrase(&self, doc_id: usize, phrase: &PhraseQuery) -> bool {
+        self.phrase_match_slop(doc_id, phrase).is_some()
+    }
+
+    fn phrase_match_slop(&self, doc_id: usize, phrase: &PhraseQuery) -> Option<usize> {
         if phrase.terms.is_empty() {
-            return false;
+            return None;
         }
         if phrase.terms.len() == 1 {
-            return self.contains_normalized_term(doc_id, &phrase.terms[0]);
+            return self
+                .contains_normalized_term(doc_id, &phrase.terms[0])
+                .then_some(0);
         }
 
-        let Some(first_positions) = self.positions_for_term_in_doc(&phrase.terms[0], doc_id) else {
-            return false;
-        };
-
-        let mut lookup_sets: Vec<HashSet<usize>> = Vec::with_capacity(phrase.terms.len() - 1);
-        for term in phrase.terms.iter().skip(1) {
+        let mut position_lists: Vec<&[usize]> = Vec::with_capacity(phrase.terms.len());
+        for term in &phrase.terms {
             let Some(positions) = self.positions_for_term_in_doc(term, doc_id) else {
-                return false;
+                return None;
             };
-            lookup_sets.push(positions.iter().copied().collect());
+            position_lists.push(positions);
         }
 
-        'outer: for start in first_positions {
-            for (offset, set) in lookup_sets.iter().enumerate() {
-                if !set.contains(&(start + offset + 1)) {
-                    continue 'outer;
+        let mut best_match: Option<usize> = None;
+        for &start in position_lists[0] {
+            if let Some(used_slop) =
+                find_phrase_match_with_slop(&position_lists, 1, start, 0, phrase.slop)
+            {
+                best_match = Some(best_match.map_or(used_slop, |best| best.min(used_slop)));
+                if used_slop == 0 {
+                    break;
                 }
             }
-            return true;
         }
 
-        false
+        best_match
     }
 }
 
@@ -689,6 +694,49 @@ fn is_supported_file(path: &Path, extensions: &HashSet<String>) -> bool {
     extensions.contains(&extension.to_ascii_lowercase())
 }
 
+fn find_phrase_match_with_slop(
+    position_lists: &[&[usize]],
+    term_index: usize,
+    previous_position: usize,
+    used_slop: usize,
+    max_slop: usize,
+) -> Option<usize> {
+    if term_index == position_lists.len() {
+        return Some(used_slop);
+    }
+
+    let mut best_match: Option<usize> = None;
+    for &position in position_lists[term_index] {
+        if position <= previous_position {
+            continue;
+        }
+
+        let next_slop = used_slop + (position - previous_position - 1);
+        if next_slop > max_slop {
+            break;
+        }
+
+        if let Some(match_slop) = find_phrase_match_with_slop(
+            position_lists,
+            term_index + 1,
+            position,
+            next_slop,
+            max_slop,
+        ) {
+            best_match = Some(best_match.map_or(match_slop, |best| best.min(match_slop)));
+            if match_slop == used_slop {
+                break;
+            }
+        }
+    }
+
+    best_match
+}
+
+fn phrase_boost(phrase: &PhraseQuery, used_slop: usize) -> f64 {
+    (2.0 * phrase.terms.len() as f64) / (1.0 + used_slop as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +761,40 @@ mod tests {
         let results = engine.search("\"distributed systems\"", 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "a.txt");
+    }
+
+    #[test]
+    fn proximity_phrase_matches_within_slop() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("exact.txt", "distributed systems are fun");
+        engine.add_document("near.txt", "distributed storage and systems are fun");
+        engine.add_document("reversed.txt", "systems and distributed are mentioned");
+
+        let exact_results = engine.search("\"distributed systems\"", 10);
+        assert_eq!(exact_results.len(), 1);
+        assert_eq!(exact_results[0].path, "exact.txt");
+
+        let proximity_results = engine.search("\"distributed systems\"~2", 10);
+        assert_eq!(proximity_results.len(), 2);
+        assert_eq!(proximity_results[0].path, "exact.txt");
+        assert_eq!(proximity_results[1].path, "near.txt");
+    }
+
+    #[test]
+    fn required_proximity_phrase_filters_results() {
+        let mut engine = SearchEngine::new();
+        engine.add_document("guide.txt", "rust distributed systems guide");
+        engine.add_document("near.txt", "rust distributed storage systems guide");
+        engine.add_document(
+            "far.txt",
+            "rust distributed storage indexing examples systems guide",
+        );
+
+        let results = engine.search("+\"distributed systems\"~2 rust", 10);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|result| result.path == "guide.txt"));
+        assert!(results.iter().any(|result| result.path == "near.txt"));
+        assert!(!results.iter().any(|result| result.path == "far.txt"));
     }
 
     #[test]
