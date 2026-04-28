@@ -34,6 +34,8 @@
 //! ```
 
 pub mod document;
+#[cfg(feature = "python-bindings")]
+mod ffi;
 pub mod index;
 pub mod query;
 pub mod storage;

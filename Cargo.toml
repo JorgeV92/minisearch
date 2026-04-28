@@ -9,9 +9,14 @@ readme = "README.md"
 keywords = ["search", "index", "bm25", "rust", "inverted-index"]
 categories = ["command-line-utilities", "text-processing"]
 
+[features]
+default = []
+python-bindings = []
+
 [lib]
 name = "minisearch"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "minisearch"

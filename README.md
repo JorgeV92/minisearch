@@ -30,6 +30,37 @@ To use the CLI locally:
 cargo run -- <command>
 ```
 
+## Python Bindings
+
+The repository also includes a small Python wrapper in `python/minisearch` that calls the Rust backend through a C ABI exposed by this crate.
+
+Build the shared library:
+
+```bash
+cargo build --release --features python-bindings
+```
+
+Run the Python example from the repo root:
+
+```bash
+python3 python/examples/basic.py
+```
+
+Or use it directly:
+
+```python
+from minisearch import SearchEngine, SearchOptions
+
+engine = SearchEngine()
+engine.add_document("guides/rust.txt", "Rust phrase search and BM25 ranking.")
+results = engine.search("rust", SearchOptions(top_k=5))
+
+for result in results:
+    print(result.path, result.score)
+```
+
+If the shared library lives outside `target/release` or `target/debug`, set `MINISEARCH_LIBRARY` to the full path before importing `minisearch`.
+
 ## Quick Start
 
 ```rust
